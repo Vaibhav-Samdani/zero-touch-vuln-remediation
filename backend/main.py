@@ -34,7 +34,7 @@ async def init_database():
         await db.execute("CREATE TABLE IF NOT EXISTS pr_mappings (pr_number INTEGER PRIMARY KEY, thread_id TEXT NOT NULL)")
         # For tracking LangGraph node states
         await db.execute("CREATE TABLE IF NOT EXISTS workflow_state (thread_id TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at TEXT NOT NULL)")
-        # NEW: For the priority queue system
+        # For the priority queue system
         await db.execute("""
             CREATE TABLE IF NOT EXISTS vulnerabilities (
                 vuln_id TEXT PRIMARY KEY, 
@@ -109,86 +109,85 @@ NODE_LOG_MAP = {
     "fetch_pr_feedback": "[AGENT] 🔄 Waking up. Fetching human peer review feedback..."
 }
 
-async def process_queue():
-    """Constantly polls the SQLite database for PENDING tasks and processes them sequentially."""
-    print("[SYSTEM] Background Queue Processor Started.")
-    while True:
-        try:
-            async with aiosqlite.connect("state_db.sqlite") as db:
-                # Add print to confirm the query is running
-                # TODO : There is a problem which is like while 1st vuln is at approval part then second one starts which causes problem.
-                print("[DEBUG] Polling DB for PENDING tasks...")
-                async with db.execute("SELECT vuln_id, data FROM vulnerabilities WHERE status = 'PENDING' ORDER BY score DESC LIMIT 1") as cursor:
-                    row = await cursor.fetchone()
+async def process_single_task():
+    """Processes exactly one PENDING task from the database. Recursively calls itself when finished."""
+    async with aiosqlite.connect("state_db.sqlite") as db:
+        # ATOMIC CHECK: Only pick up if nothing is currently IN_PROGRESS
+        async with db.execute("SELECT count(*) FROM vulnerabilities WHERE status = 'IN_PROGRESS'") as cursor:
+            if (await cursor.fetchone())[0] > 0:
+                print("[SYSTEM] An agent is already active. Yielding.")
+                return 
+
+        # Grab the highest priority PENDING task
+        async with db.execute("SELECT vuln_id, data FROM vulnerabilities WHERE status = 'PENDING' ORDER BY score DESC LIMIT 1") as cursor:
+            row = await cursor.fetchone()
             
-            if not row:
-                print("[DEBUG] No PENDING tasks found. Sleeping...")
-                await asyncio.sleep(5)
-                continue
-                
-            vuln_id, raw_data = row
-            print("Row Data --> ", raw_data)
-            task_data = json.loads(raw_data)
+    if not row:
+        print("[SYSTEM] Queue empty, returning to idle state.")
+        return
+
+    vuln_id, raw_data = row
+    task_data = json.loads(raw_data)
+    
+    # Lock the task so no other worker picks it up
+    async with aiosqlite.connect("state_db.sqlite") as db:
+        await db.execute("UPDATE vulnerabilities SET status = 'IN_PROGRESS' WHERE vuln_id = ?", (vuln_id,))
+        await db.commit()
+
+    print(f"\n[QUEUE] Processing Vulnerability: {vuln_id}")
+    await manager.broadcast({"vuln_id": vuln_id, "status": "IN_PROGRESS"})
+
+    try:
+        # Prepare state for the remediation agent
+        initial_state = {
+            "issue_description": str(task_data),
+            "repo_owner": task_data.get("repo_owner", "Rahul-Data-Scientist"), # Fallback
+            "repo_name": task_data.get("repo_name", "vulnerability-remediation"), # Fallback
+            "messages": []
+        }
+        
+        config = {"configurable": {"thread_id": vuln_id}}
+        await update_workflow_state(vuln_id, IN_PROGRESS)
+        
+        async with AsyncSqliteSaver.from_conn_string("state_db.sqlite") as checkpointer:
+            remediation_graph = await build_graph(checkpointer=checkpointer)
             
-            # Lock the task so no other worker picks it up
+            # Stream the LangGraph execution
+            async for event in remediation_graph.astream(initial_state, config=config, stream_mode="updates"):
+                for node_name, state_updates in event.items():
+                    if node_name == "github_tools": 
+                        continue
+                    
+                    log_msg = NODE_LOG_MAP.get(node_name, f"[SYSTEM] Executing {node_name}...")
+                    await manager.broadcast({"vuln_id": vuln_id, "node": node_name, "log": log_msg})
+
+                    # Handle failure logs visually
+                    if node_name == "check_ci_status" and state_updates.get("ci_status") == "failure":
+                        await manager.broadcast({"vuln_id": vuln_id, "log": "[WARNING] ❌ CI/CD Pipeline failed. Triggering self-healing loop..."})
+
+                    # Handle the human interrupt
+                    if node_name == "wait_for_human_approval":
+                        await manager.broadcast({"type": "ACTION_REQUIRED", "vuln_id": vuln_id})
+                        return # Stop the chain reaction here; Webhook will resume it later
+
+        # Check if it finished without being interrupted
+        current_state = await get_workflow_state(vuln_id)
+        if current_state != WAITING_FOR_HUMAN_APPROVAL:
+            # Mark as resolved in DB
             async with aiosqlite.connect("state_db.sqlite") as db:
-                await db.execute("UPDATE vulnerabilities SET status = 'IN_PROGRESS' WHERE vuln_id = ?", (vuln_id,))
+                await db.execute("UPDATE vulnerabilities SET status = 'RESOLVED' WHERE vuln_id = ?", (vuln_id,))
                 await db.commit()
-
-            print(f"\n[QUEUE] Processing Vulnerability: {vuln_id}")
-            await manager.broadcast({"vuln_id": vuln_id, "status": "IN_PROGRESS"})
-
-            # Prepare state for the remediation agent
-            initial_state = {
-                # "issue_description": task_data.get("description", f"Vulnerability {vuln_id} requires remediation."),
-                "issue_description": str(task_data),
-                
-                # TODO: Update the repo_owner and repo_name fields to be dynamic based on the CSV input or some mapping logic. For now, using placeholders.
-                "repo_owner": task_data.get("repo_owner", "Rahul-Data-Scientist"), # Fallbacks if not in CSV
-                "repo_name": task_data.get("repo_name", "vulnerability-remediation"),
-                "messages": []
-            }
             
-            config = {"configurable": {"thread_id": vuln_id}}
-            await update_workflow_state(vuln_id, IN_PROGRESS)
+            await update_workflow_state(vuln_id, COMPLETED)
+            await manager.broadcast({"vuln_id": vuln_id, "status": "COMPLETED", "log": f"[SYSTEM] 🎉 {vuln_id} Resolved."})
             
-            async with AsyncSqliteSaver.from_conn_string("state_db.sqlite") as checkpointer:
-                remediation_graph = await build_graph(checkpointer=checkpointer)
-                
-                # Stream the LangGraph execution
-                async for event in remediation_graph.astream(initial_state, config=config, stream_mode="updates"):
-                    for node_name, state_updates in event.items():
-                        if node_name == "github_tools": 
-                            continue
-                        
-                        log_msg = NODE_LOG_MAP.get(node_name, f"[SYSTEM] Executing {node_name}...")
-                        await manager.broadcast({"vuln_id": vuln_id, "node": node_name, "log": log_msg})
+            # RECURSIVE TRIGGER: Start the next task in the queue immediately
+            await process_single_task()
+            
+    except Exception as e:
+        print(f"[QUEUE ERROR] {str(e)}")
+        await manager.broadcast({"vuln_id": vuln_id, "log": f"[CRITICAL ERROR] {str(e)}"})
 
-                        # Handle failure logs visually
-                        if node_name == "check_ci_status" and state_updates.get("ci_status") == "failure":
-                            await manager.broadcast({"vuln_id": vuln_id, "log": "[WARNING] ❌ CI/CD Pipeline failed. Triggering self-healing loop..."})
-
-                        # Handle the human interrupt
-                        if node_name == "wait_for_human_approval":
-                            await manager.broadcast({"type": "ACTION_REQUIRED", "vuln_id": vuln_id})
-                            break 
-                
-                # Check if it finished without being interrupted
-                current_state = await get_workflow_state(vuln_id)
-                if current_state != WAITING_FOR_HUMAN_APPROVAL:
-                    # Mark as resolved in DB
-                    async with aiosqlite.connect("state_db.sqlite") as db:
-                        await db.execute("UPDATE vulnerabilities SET status = 'RESOLVED' WHERE vuln_id = ?", (vuln_id,))
-                        await db.commit()
-                    
-                    await update_workflow_state(vuln_id, COMPLETED)
-                    await manager.broadcast({"vuln_id": vuln_id, "status": "COMPLETED", "log": f"[SYSTEM] 🎉 {vuln_id} Resolved."})
-                    
-                    # TODO: Add your PostgreSQL push logic here when ready
-                    
-        except Exception as e:
-            print(f"[QUEUE ERROR] {str(e)}")
-            await asyncio.sleep(5)
 
 # --- BACKGROUND RESUME TASK ---
 async def resume_agent_background(thread_id: str):
@@ -223,6 +222,9 @@ async def resume_agent_background(thread_id: str):
         await update_workflow_state(thread_id, COMPLETED)
         await manager.broadcast({"vuln_id": thread_id, "status": "COMPLETED", "log": "[SYSTEM] ✅ Human approval processed. Workflow complete."})
 
+        # RECURSIVE TRIGGER: After human approval loop finishes, process next item in queue
+        await process_single_task()
+
     except Exception as e:
         await update_workflow_state(thread_id, FAILED)
         print(f"[CRITICAL ERROR] Resume failed: {e}")
@@ -235,15 +237,9 @@ async def lifespan(app: FastAPI):
     await init_database()
     print("[SYSTEM] Booting Security Remediation Core Agent Environment...")
     await initialize_agent_components()
-    
-    # Start the background polling loop
-    queue_task = asyncio.create_task(process_queue())
-    
     print("[SYSTEM] System ready. Awaiting inbound vulnerability triggers.\n" + "="*60)
     yield
-    
-    # Clean up task on shutdown
-    queue_task.cancel()
+    # No more background polling loop to cancel!
 
 app = FastAPI(lifespan=lifespan)
 
@@ -267,7 +263,7 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 @app.post("/api/v1/upload")
-async def handle_csv_upload(file: UploadFile = File(...)):
+async def handle_csv_upload(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
     """Handles the sequential pre-processing pipeline."""
     try:
         # 1. PARSING
@@ -298,11 +294,9 @@ async def handle_csv_upload(file: UploadFile = File(...)):
         tasks = prio_state["prioritized_data"]
         async with aiosqlite.connect("state_db.sqlite") as db:
             for task in tasks:
-                # FIX: Assign directly to the task dictionary so it is sent to the UI!
                 if "vuln_id" not in task or not task["vuln_id"]:
                     task["vuln_id"] = f"VULN-{uuid.uuid4().hex[:6]}"
                 
-                print('======>>>>>>>', task["vuln_id"])
                 score = task.get("priority_score", 5.0)
                 
                 await db.execute(
@@ -315,11 +309,14 @@ async def handle_csv_upload(file: UploadFile = File(...)):
         
         # 5. UI SYNCHRONIZATION
         await manager.broadcast({
-            "type": "NEW_BATCH", # Ensure your frontend catches this
+            "type": "NEW_BATCH",
             "step": "Remediation",
             "log": "[SYSTEM] Pre-processing complete. Handing off to Remediation Queue...",
             "tasks": tasks[:10] # Send top 10 to UI
         })
+
+        # 6. KICKSTART THE BACKGROUND QUEUE
+        background_tasks.add_task(process_single_task)
 
         return {"status": "success", "queued_items": len(tasks)}
 
@@ -362,12 +359,11 @@ async def github_webhook_listener(request: Request, background_tasks: Background
         if not thread_id:
             return {"status": "ignored"}
 
-        
         claimed = await claim_workflow_for_resume(thread_id)
         if not claimed:
             return {"status": "ignored", "reason": "already_resuming"}
 
-        # FIX: Force UI update IMMEDIATELY so the user knows the merge was detected
+        # Force UI update IMMEDIATELY so the user knows the merge was detected
         await manager.broadcast({
             "vuln_id": thread_id, 
             "status": "IN_PROGRESS", 
