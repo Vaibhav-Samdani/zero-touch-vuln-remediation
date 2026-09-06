@@ -1,0 +1,11 @@
+This is your strongest Action point.
+
+For scheduling vulnerabilities, I took inspiration from Operating System CPU scheduling and process states.
+
+Similar to how an operating system manages processes, I modeled vulnerabilities through different states, such as Ready, Running, Waiting, Completed, and Error.
+
+The scheduler was responsible for selecting vulnerabilities that were ready for processing and routing them to the remediation workflow.
+
+If a vulnerability required human approval, it could move into a Waiting state instead of being treated as continuously active. Once approval or feedback was received, the vulnerability could continue through the appropriate workflow.
+
+This gave the system a structured way to manage vulnerabilities that were simultaneously at different stages of remediation.

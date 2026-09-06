@@ -1,0 +1,5 @@
+Finally, I built a Next.js frontend with two major views.
+
+The first was a dashboard for visualizing overall metrics, such as vulnerability distribution, remediation progress, LLM token usage, and related costs.
+
+The second was a live workflow view that showed the current state of individual vulnerabilities, allowing users to see whether a vulnerability was being parsed, prioritized, remediated, waiting for approval, or completed.

@@ -1,0 +1,5 @@
+# Pitch
+We don't rely on a predefined schema because different vulnerability scanners such as Trivy, Snyk, and Grype produce different JSON structures.
+Instead, our system first performs runtime schema inference by recursively analyzing the incoming JSON. 
+It identifies objects, arrays, nested structures, data types, and potential entry points. This structural metadata is then provided to an LLM, which dynamically generates a scanner-specific flattening function. 
+We execute and validate that function, and if it fails or produces an empty DataFrame, the error is fed back to the LLM for self-correction, with a maximum of three retries.

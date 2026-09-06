@@ -1,0 +1,3 @@
+The project involved multiple specialized agents built by different team members.
+
+My role was to integrate them into a single coordinated system using Python, FastAPI, and LangGraph, so that the agents could work as part of a complete remediation workflow rather than operating independently.
